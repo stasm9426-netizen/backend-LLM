@@ -5,6 +5,7 @@ import io
 import traceback
 from pathlib import Path
 from typing import Any
+from dataclasses import dataclass
 
 from dotenv import load_dotenv
 
@@ -12,16 +13,18 @@ import pandas as pd
 import numpy as np
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field
-from pydantic_ai import Agent
-from pydantic_ai.models.openai import OpenAIModel
+from pydantic import BaseModel
+from pydantic_ai import Agent, RunContext
+from pydantic_ai.models.openai import OpenAIChatModel
 
 load_dotenv(Path(__file__).resolve().parent.parent / ".env")
 
 DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY", "")
-DEEPSEEK_MODEL = os.getenv("DEEPSEEK_MODEL", "deepseek-v4-flash")
+DEEPSEEK_MODEL = os.getenv("DEEPSEEK_MODEL", "deepseek-chat")
 MAX_RETRIES = int(os.getenv("MAX_RETRIES", "5"))
-DEEPSEEK_BASE = "https://api.deepseek.com"
+
+os.environ.setdefault("OPENAI_API_KEY", DEEPSEEK_API_KEY)
+os.environ.setdefault("OPENAI_BASE_URL", "https://api.deepseek.com/v1")
 
 app = FastAPI(title="LLM Agent Backend")
 
@@ -55,14 +58,19 @@ class AnalysisResult(BaseModel):
     charts: list[dict] | None = None
 
 
+@dataclass
+class Deps:
+    dataset_json: str
+
+
 SYSTEM_PROMPT = """Ты аналитик данных. Датасет загружен как pandas DataFrame 'df', типы колонок известны.
 
-Твоя задача: вызвать инструмент execute_python с Python-кодом, который проанализирует данные.
+Вызови инструмент execute_python с Python-кодом, который проанализирует данные.
 
 Код должен:
 - НЕ печатать НИЧЕГО кроме финального print(json.dumps(result, ensure_ascii=False))
 - НИКАКИХ print(df.shape), print(df.columns), print(df.head())
-- Вернуть словарь result со строгой структурой:
+- Вернуть словарь result со структурой:
   {
     "overview": "2-3 предложения с ключевыми цифрами",
     "keyMetrics": [{"label": "...", "value": "42 или 42.5%", "description": "..."}],
@@ -106,39 +114,44 @@ def execute_python_code(code: str, dataset_json: str) -> str:
     return stdout.getvalue().strip()
 
 
+agent = Agent(
+    OpenAIChatModel(DEEPSEEK_MODEL),
+    system_prompt=SYSTEM_PROMPT,
+    output_type=AnalysisResult,
+    deps_type=Deps,
+    retries=MAX_RETRIES,
+)
+
+
+@agent.tool
+async def execute_python(ctx: RunContext[Deps], code: str) -> str:
+    """Execute Python code for data analysis. df DataFrame is pre-loaded with the dataset.
+    Print ONLY: print(json.dumps(result, ensure_ascii=False)).
+    No debug prints allowed — only the final JSON."""
+    return execute_python_code(code, ctx.deps.dataset_json)
+
+
 @app.post("/api/analyze")
 async def analyze(req: AnalyzeRequest):
     if not DEEPSEEK_API_KEY:
         raise HTTPException(status_code=500, detail="DEEPSEEK_API_KEY not configured on server")
 
-    model = OpenAIModel(
-        model_name=DEEPSEEK_MODEL,
-        base_url=DEEPSEEK_BASE,
-        api_key=DEEPSEEK_API_KEY,
-    )
-
-    agent = Agent(
-        model,
-        system_prompt=SYSTEM_PROMPT,
-        result_type=AnalysisResult,
-    )
-
-    @agent.tool
-    async def execute_python(code: str) -> str:
-        """Execute Python code for data analysis. df DataFrame is pre-loaded with the dataset.
-        Print ONLY: print(json.dumps(result, ensure_ascii=False)).
-        No debug prints allowed — only the final JSON."""
-        return execute_python_code(code, req.dataset)
-
     full_msg = (req.message or "Проанализируй датасет и верни полный JSON с метриками, инсайтами и графиками")
     full_msg += f"\n\n{req.column_summary}"
 
     try:
-        result = await agent.run(full_msg)
+        result = await agent.run(full_msg, deps=Deps(dataset_json=req.dataset))
 
-        tool_calls = sum(1 for m in result.all_messages() if hasattr(m, 'tool_calls') and m.tool_calls)
+        tool_calls = 0
+        try:
+            for m in result.all_messages():
+                for part in getattr(m, 'parts', []):
+                    if getattr(part, 'part_kind', '') == 'tool-call':
+                        tool_calls += 1
+        except Exception:
+            tool_calls = 1
 
-        response = result.data.model_dump()
+        response = result.output.model_dump()
         response["iterations"] = max(tool_calls, 1)
         response["isError"] = False
         return response
